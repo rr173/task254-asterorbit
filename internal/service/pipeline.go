@@ -19,6 +19,11 @@ func (s *Service) ImportObservation(arcID, stationID, catalogID string, obsUTC t
 	if err != nil {
 		return model.Observation{}, err
 	}
+	// 封存弧段禁止再导入测角记录：封存快照以该时刻的观测集合为审计边界，
+	// 继续导入会破坏快照不可变性。
+	if arc.Sealed() {
+		return model.Observation{}, model.ErrSealedArc
+	}
 	if _, err := s.DB.GetStation(stationID); err != nil {
 		return model.Observation{}, err
 	}
