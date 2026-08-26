@@ -149,12 +149,18 @@ func (s *Service) PublishOrbitSnapshot(arcID, catalogID string) (model.OrbitSnap
 	if err != nil {
 		return model.OrbitSnapshot{}, err
 	}
+	// 内容指纹只取科学内容（轨道+星表+台站校准），不含发布时间戳，
+	// 保证重复发布同一轨道解产生稳定指纹，可识别为同一份可复现结果。
+	content, err := snapshot.BuildContent(orb, catID, stations)
+	if err != nil {
+		return model.OrbitSnapshot{}, err
+	}
 	snap := model.OrbitSnapshot{
 		ID:        newID("snap"),
 		ArcID:     arcID,
 		OrbitID:   orb.ID,
 		CatalogID: catID,
-		Hash:      snapshot.ComputeHash(payload),
+		Hash:      snapshot.ComputeHash(content),
 		Status:    model.SnapStatusPublished,
 		CreatedAt: now(),
 		Payload:   payload,
