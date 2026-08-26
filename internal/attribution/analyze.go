@@ -23,6 +23,7 @@ type groupStat struct {
 	meanDec   float64 // 度
 	offsetArc float64 // 平均残差向量模 角秒
 	rmsArc    float64 // 组内 RMS 角秒
+	sig       float64 // 组内一致性信噪比 offset / max(RMS, ε)
 }
 
 func summarize(items []ObsResidual, key func(ObsResidual) string) map[string]groupStat {
@@ -49,9 +50,64 @@ func summarize(items []ObsResidual, key func(ObsResidual) string) map[string]gro
 		}
 		g.rmsArc = math.Sqrt(ss / float64(g.count))
 		g.offsetArc = math.Hypot(g.meanRA, g.meanDec) * 3600
+		g.sig = g.offsetArc / math.Max(g.rmsArc, 1e-3)
 		out[k] = g
 	}
 	return out
+}
+
+// catalogConsistency 度量星表分组偏移在台站间的一致性：各台站平均偏移向量相互对齐的程度。
+// 返回 (一致偏移角秒模, 跨台站散布角秒)。一致性越强，散布越接近 0。
+func catalogConsistency(byStation map[string]groupStat) (commonArc, spreadArc float64) {
+	if len(byStation) == 0 {
+		return 0, 0
+	}
+	var sumRA, sumDec float64
+	var n float64
+	for _, g := range byStation {
+		sumRA += g.meanRA
+		sumDec += g.meanDec
+		n++
+	}
+	meanRA := sumRA / n
+	meanDec := sumDec / n
+	commonArc = math.Hypot(meanRA, meanDec) * 3600
+	var ss float64
+	for _, g := range byStation {
+		dra := (g.meanRA - meanRA) * 3600
+		ddc := (g.meanDec - meanDec) * 3600
+		ss += dra*dra + ddc*ddc
+	}
+	spreadArc = math.Sqrt(ss / n)
+	return commonArc, spreadArc
+}
+
+// stationDistinctArc 度量某台站偏移相对于其余台站平均偏移的“独有”偏移量（角秒）。
+// 台站固定偏移是局部性的：仅该台站偏离，其余台站接近零或彼此对齐；
+// 若其余台站也朝同方向偏移（星表整体偏移），则独有偏移被抵消，归因应让位于星表。
+func stationDistinctArc(byStation map[string]groupStat, target string) float64 {
+	t, ok := byStation[target]
+	if !ok {
+		return 0
+	}
+	var sumRA, sumDec float64
+	var n float64
+	for id, g := range byStation {
+		if id == target {
+			continue
+		}
+		sumRA += g.meanRA
+		sumDec += g.meanDec
+		n++
+	}
+	if n == 0 {
+		return t.offsetArc
+	}
+	restRA := sumRA / n
+	restDec := sumDec / n
+	dra := (t.meanRA - restRA) * 3600
+	ddc := (t.meanDec - restDec) * 3600
+	return math.Hypot(dra, ddc)
 }
 
 func globalRMS(items []ObsResidual) float64 {
@@ -113,26 +169,45 @@ func Analyze(arcID string, items []ObsResidual) model.Attribution {
 	byStation := summarize(items, func(it ObsResidual) string { return it.StationID })
 	byCatalog := summarize(items, func(it ObsResidual) string { return it.CatalogID })
 
-	// 台站信号：某台站残差平均偏移较大且组内高度一致（方向稳定、组内 RMS 远小于偏移量）。
+	// 台站信号：某台站残差平均偏移较大、组内高度一致，且该偏移为该台站独有
+	// （与其余台站的平均偏移显著不同）。后者是台站偏移区别于星表整体偏移的关键：
+	// 星表整体偏移会让所有台站同向偏移，台站独有偏移被抵消，不应记为台站信号。
 	bestStation, bestStationStat, bestStationSig := "", groupStat{}, 0.0
 	for id, g := range byStation {
 		if g.count < 2 {
 			continue
 		}
-		sig := g.offsetArc / math.Max(g.rmsArc, 1e-3)
-		if g.offsetArc > 5 && g.rmsArc < 0.5*g.offsetArc && sig > 2 && sig > bestStationSig {
+		if !(g.offsetArc > 5 && g.rmsArc < 0.5*g.offsetArc && g.sig > 2) {
+			continue
+		}
+		distinct := stationDistinctArc(byStation, id)
+		if distinct < 0.5*g.offsetArc {
+			// 独有偏移不足：其余台站同向偏移，更像星表整体偏移，不计为台站信号。
+			continue
+		}
+		// 台站信噪比以独有偏移 / 组内 RMS 衡量，反映局部一致性强度。
+		sig := distinct / math.Max(g.rmsArc, 1e-3)
+		if sig > bestStationSig {
 			bestStation, bestStationStat, bestStationSig = id, g, sig
 		}
 	}
 	// 星表信号：某星表残差平均偏移跨台站一致地偏大且组内一致。
+	// 用台站间一致性（跨台站散布小）度量其强度，散布越小越像星表系统偏差。
 	bestCatalog, bestCatalogStat, bestCatalogSig := "", groupStat{}, 0.0
-	for id, g := range byCatalog {
-		if g.count < 2 {
-			continue
-		}
-		sig := g.offsetArc / math.Max(g.rmsArc, 1e-3)
-		if g.offsetArc > 5 && g.rmsArc < 0.5*g.offsetArc && sig > 1.5 && sig > bestCatalogSig {
-			bestCatalog, bestCatalogStat, bestCatalogSig = id, g, sig
+	commonArc, spreadArc := catalogConsistency(byStation)
+	if commonArc > 5 && spreadArc < 0.5*commonArc && len(byStation) >= 2 {
+		for id, g := range byCatalog {
+			if g.count < 2 {
+				continue
+			}
+			if !(g.offsetArc > 5 && g.rmsArc < 0.5*g.offsetArc && g.sig > 1.5) {
+				continue
+			}
+			// 星表信噪比以跨台站一致偏移 / 跨台站散布衡量。
+			sig := commonArc / math.Max(spreadArc, 1e-3)
+			if sig > bestCatalogSig {
+				bestCatalog, bestCatalogStat, bestCatalogSig = id, g, sig
+			}
 		}
 	}
 	// 模型信号：角距随观测天数单调增长（未建模扰动累积）。
@@ -144,24 +219,36 @@ func Analyze(arcID string, items []ObsResidual) model.Attribution {
 	slope, corr := linregSlope(xs, ys)
 
 	switch {
-	case bestStation != "" && bestCatalog == "":
+	case bestStation != "" && (bestCatalog == "" || bestStationSig >= bestCatalogSig):
+		// 台站信号成立且一致性不弱于星表信号：归因台站固定偏移。
 		a.Kind = model.AttrKindStation
 		a.TargetID = bestStation
 		a.MeanRADeg = bestStationStat.meanRA
 		a.MeanDecDeg = bestStationStat.meanDec
 		a.RMSArcsec = bestStationStat.rmsArc
 		a.Confidence = clamp(bestStationSig / (bestStationSig + 1))
-		a.Evidence = fmt.Sprintf("台站 %s 残差持续朝固定方向偏移 %.2f 角秒（组内 RMS %.2f 角秒，信噪比 %.1f），符合台站钟差/站址偏差特征",
-			bestStation, bestStationStat.offsetArc, bestStationStat.rmsArc, bestStationSig)
+		if bestCatalog != "" {
+			a.Evidence = fmt.Sprintf("台站 %s 独有偏移（组内一致性信噪比 %.1f）强于星表 %s 跨台站一致性信噪比 %.1f，优先归因台站固定偏移",
+				bestStation, bestStationSig, bestCatalog, bestCatalogSig)
+		} else {
+			a.Evidence = fmt.Sprintf("台站 %s 残差持续朝固定方向偏移 %.2f 角秒（组内 RMS %.2f 角秒，信噪比 %.1f），符合台站钟差/站址偏差特征",
+				bestStation, bestStationStat.offsetArc, bestStationStat.rmsArc, bestStationSig)
+		}
 	case bestCatalog != "":
+		// 星表跨台站一致性更强：归因星表系统偏差。
 		a.Kind = model.AttrKindCatalog
 		a.TargetID = bestCatalog
 		a.MeanRADeg = bestCatalogStat.meanRA
 		a.MeanDecDeg = bestCatalogStat.meanDec
 		a.RMSArcsec = bestCatalogStat.rmsArc
 		a.Confidence = clamp(bestCatalogSig / (bestCatalogSig + 1))
-		a.Evidence = fmt.Sprintf("星表 %s 残差整体偏移 %.2f 角秒（信噪比 %.1f），跨台站一致，符合参考星表系统偏差特征",
-			bestCatalog, bestCatalogStat.offsetArc, bestCatalogSig)
+		if bestStation != "" {
+			a.Evidence = fmt.Sprintf("星表 %s 跨台站一致偏移 %.2f 角秒（一致性信噪比 %.1f）强于台站 %s 组内信噪比 %.1f，优先归因星表系统偏差",
+				bestCatalog, commonArc, bestCatalogSig, bestStation, bestStationSig)
+		} else {
+			a.Evidence = fmt.Sprintf("星表 %s 残差整体偏移 %.2f 角秒（信噪比 %.1f），跨台站一致，符合参考星表系统偏差特征",
+				bestCatalog, bestCatalogStat.offsetArc, bestCatalogSig)
+		}
 	case slope > 0.05 && corr > 0.4:
 		a.Kind = model.AttrKindModel
 		a.SlopePerDay = slope
