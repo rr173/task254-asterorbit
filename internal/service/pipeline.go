@@ -58,7 +58,8 @@ func (s *Service) ComputeResiduals(arcID string) (int, error) {
 	}
 	n := 0
 	for _, o := range obs {
-		if o.Status == model.ObsStatusAnomalous {
+		// 仅明确排除的观测退出重算；异常观测仍需研究者复核，保留参与重算。
+		if o.Status == model.ObsStatusExcluded {
 			continue
 		}
 		st, err := s.DB.GetStation(o.StationID)
