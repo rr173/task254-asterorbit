@@ -12,9 +12,15 @@ import (
 
 // DeriveObservationID 由 (弧段, 台站, 星表, 时刻, 赤经, 赤纬) 生成确定性幂等 ID，
 // 保证同一观测重复导入不会创建两条记录。
+//
+// 时刻统一按 UTC 绝对时间点参与哈希：同一物理时刻无论以哪个时区文字表示
+// （如 `Z`、`+09:00`、`-05:00`）都得到同一 ID，从而保证重复导入幂等；
+// 而真正不同的时刻因时间点不同而得到不同 ID，不会互相覆盖。
+// 这里刻意不使用 t.Format(time.RFC3339Nano) 这类带时区偏移的字符串——
+// 那会让同一时刻因时区表示不同而派生不同 ID，导致重复导入新建记录。
 func DeriveObservationID(arcID, stationID, catalogID string, t time.Time, ra, dec float64) string {
-	raw := fmt.Sprintf("%s|%s|%s|%s|%.6f|%.6f",
-		arcID, stationID, catalogID, t.Format(time.RFC3339Nano), ra, dec)
+	raw := fmt.Sprintf("%s|%s|%s|%d|%.6f|%.6f",
+		arcID, stationID, catalogID, t.UTC().UnixNano(), ra, dec)
 	h := sha256.Sum256([]byte(raw))
 	return "obs_" + hex.EncodeToString(h[:])[:16]
 }
