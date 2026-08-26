@@ -60,9 +60,7 @@ func globalRMS(items []ObsResidual) float64 {
 	}
 	var ss float64
 	for _, it := range items {
-		dra := it.ResRA * 3600
-		ddc := it.ResDec * 3600
-		ss += dra*dra + ddc*ddc
+		ss += it.SepArcsec * it.SepArcsec
 	}
 	return math.Sqrt(ss / float64(len(items)))
 }
@@ -136,12 +134,21 @@ func Analyze(arcID string, items []ObsResidual) model.Attribution {
 		}
 	}
 	// 模型信号：角距随观测天数单调增长（未建模扰动累积）。
+	// Days 为“相对首观测的天数”，随观测推进单调递增；故角距随时间增长时回归斜率为正，
+	// 其量纲即真实的角秒/天增长速率。
 	var xs, ys []float64
+	var spanDays float64
 	for _, it := range items {
 		xs = append(xs, it.Days)
 		ys = append(ys, it.SepArcsec)
+		if it.Days > spanDays {
+			spanDays = it.Days
+		}
 	}
 	slope, corr := linregSlope(xs, ys)
+	// 速率一致性：回归斜率外推到整个时间跨度得到的预期增长量，应与残差实际跨度内的变化量同量级，
+	// 否则即便相关系数高，所报速率也无法解释实际时间跨度下的残差演变，不予采信。
+	slopeConsistent := spanDays > 0 && slope > 0 && slope*spanDays <= gRMS*10
 
 	switch {
 	case bestStation != "" && (bestCatalog == "" || bestStationStat.offsetArc >= bestCatalogStat.offsetArc):
@@ -162,12 +169,13 @@ func Analyze(arcID string, items []ObsResidual) model.Attribution {
 		a.Confidence = clamp(bestCatalogSig / (bestCatalogSig + 1))
 		a.Evidence = fmt.Sprintf("星表 %s 残差整体偏移 %.2f 角秒（信噪比 %.1f），跨台站一致，符合参考星表系统偏差特征",
 			bestCatalog, bestCatalogStat.offsetArc, bestCatalogSig)
-	case slope > 0.05 && corr > 0.4:
+	case slope > 0.05 && corr > 0.4 && slopeConsistent:
 		a.Kind = model.AttrKindModel
 		a.SlopePerDay = slope
 		a.RMSArcsec = gRMS
 		a.Confidence = clamp(corr)
-		a.Evidence = fmt.Sprintf("残差角距随观测天数以 %.4f 角秒/天增长（相关系数 %.2f），符合未建模动力学（辐射压/行星摄动）特征", slope, corr)
+		a.Evidence = fmt.Sprintf("残差角距随观测天数以 %.4f 角秒/天增长（相关系数 %.2f，时间跨度 %.1f 天累计约 %.2f 角秒），符合未建模动力学（辐射压/行星摄动）特征",
+			slope, corr, spanDays, slope*spanDays)
 	default:
 		a.RMSArcsec = gRMS
 		a.Evidence = fmt.Sprintf("全局 RMS %.2f 角秒，未检出显著台站/星表/模型模式", gRMS)

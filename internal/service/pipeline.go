@@ -90,17 +90,19 @@ func (s *Service) Analyze(arcID string) (model.Attribution, error) {
 		return model.Attribution{}, err
 	}
 	obsMap := make(map[string]model.Observation, len(allObs))
+	// t0 取弧段首观测时刻：Days 表“相对首观测的天数”，随观测推进单调递增，
+	// 这样角距随时间增长的动力学信号才能回归出正确符号与量级的角秒/天斜率。
 	var t0 time.Time
 	for _, o := range allObs {
 		obsMap[o.ID] = o
-		if t0.IsZero() || o.ObsTimeUTC.After(t0) {
+		if t0.IsZero() || o.ObsTimeUTC.Before(t0) {
 			t0 = o.ObsTimeUTC
 		}
 	}
 	items := make([]attribution.ObsResidual, 0, len(residuals))
 	for _, r := range residuals {
 		o := obsMap[r.ObservationID]
-		days := t0.Sub(o.ObsTimeUTC).Hours() / 24.0
+		days := o.ObsTimeUTC.Sub(t0).Hours() / 24.0
 		items = append(items, attribution.ObsResidual{
 			Residual:  r,
 			StationID: o.StationID,
