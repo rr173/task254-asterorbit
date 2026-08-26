@@ -25,7 +25,10 @@ func ComputeResidual(o model.Observation, orb model.Orbit, st model.Station) mod
 	el := toElements(orb)
 	cra, cdec := propagation.ComputeTopocentric(el, o.ObsTimeUTC,
 		st.LatitudeDeg, st.LongitudeDeg, st.HeightM, 0, 0, 0)
-	cra -= st.RAZeroArcsec / 3600.0
+	// 校准量是对计算位置的加性修正（与观测偏差同向）：把台站零位偏差叠加到
+	// 计算位置上以建模台站会观测到的位置，使 O-C 残差收敛。零校准时不改变
+	// 计算位置，即“未校准残差”，其系统性偏移正是归因分析要识别的台站信号。
+	cra += st.RAZeroArcsec / 3600.0
 	cdec += st.DecZeroArcsec / 3600.0
 	resRA := o.RA - cra
 	resDec := o.Dec - cdec
